@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Pose & Hand Detection with Distance</title>
+    <link href="https://unpkg.com/material-components-web@latest/dist/material-components-web.min.css" rel="stylesheet">
+    <script src="https://unpkg.com/material-components-web@latest/dist/material-components-web.min.js"></script>
+    <style>
+        body {
+            font-family: Roboto, sans-serif;
+            margin: 2em;
+            color: #333;
+            background-color: #f8f9fa;
+            text-align: center;
+        }
+
+        h1 {
+            color: #007f8b;
+            margin-bottom: 1em;
+        }
+
+        .videoView {
+            position: relative;
+            width: 600px;
+            height: 400px;
+            margin: auto;
+        }
+
+        video, canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        canvas {
+            pointer-events: none;
+        }
+
+        button, input[type="file"], #distanceStatus, #recordingProgress {
+            display: block;
+            margin: 20px auto;
+        }
+
+        #loadingContainer {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            flex-direction: column;
+            margin-bottom: 1em;
+        }
+
+        .mdc-linear-progress {
+            width: 60%;
+            margin: auto;
+        }
+
+        #loadingText {
+            margin-bottom: 1em;
+            font-size: 1.1em;
+            color: #555;
+        }
+
+        #startButton, #recordButton, #csvLoader {
+            display: none;
+        }
+
+        #distanceStatus {
+            font-size: 1.2em;
+            font-weight: bold;
+            color: #2196f3;
+        }
+
+        #recordingProgress {
+            width: 80%; /* Adjust width as needed */
+            height: 20px; /* Adjust height as needed */
+            -webkit-appearance: none;
+            appearance: none;
+            display: none; /* Initially hidden */
+        }
+
+        #recordingProgress::-webkit-progress-bar {
+            background-color: #eee;
+            border-radius: 10px;
+        }
+
+        #recordingProgress::-webkit-progress-value {
+            background-color: #007f8b;
+            border-radius: 10px;
+        }
+
+        #recordingProgress::-moz-progress-bar {
+            background-color: #007f8b;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Pose and Hand Detection with Distance</h1>
+
+    <div id="loadingContainer">
+        <div id="loadingText">Loading MediaPipe models, please wait...</div>
+        <div role="progressbar" class="mdc-linear-progress mdc-linear-progress--indeterminate" id="loadingBar">
+            <div class="mdc-linear-progress__buffer">
+                <div class="mdc-linear-progress__buffer-bar"></div>
+                <div class="mdc-linear-progress__buffer-dots"></div>
+            </div>
+            <div class="mdc-linear-progress__bar mdc-linear-progress__primary-bar">
+                <span class="mdc-linear-progress__bar-inner"></span>
+            </div>
+            <div class="mdc-linear-progress__bar mdc-linear-progress__secondary-bar">
+                <span class="mdc-linear-progress__bar-inner"></span>
+            </div>
+        </div>
+    </div>
+
+    <div class="videoView">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+
+    <progress id="recordingProgress" value="0" max="100"></progress>    
+
+    <div id="distanceStatus"></div>
+
+    <button id="recordButton" class="mdc-button mdc-button--outlined">
+        <span class="mdc-button__ripple"></span>
+        <span class="mdc-button__label">Record</span>
+    </button>
+
+    <div id="distanceStatus"></div>
+
+    <button id="startButton" class="mdc-button mdc-button--raised">
+        <span class="mdc-button__ripple"></span>
+        <span class="mdc-button__label">Start Detection</span>
+    </button>
+
+
+    <input type="file" id="csvLoader" accept=".csv" />
+    
+    <script type="module">
+        import {
+            FilesetResolver,
+            DrawingUtils,
+            PoseLandmarker,
+            HandLandmarker
+        } from "https://cdn.skypack.dev/@mediapipe/tasks-vision@0.10.0";
+    
+        const video = document.getElementById("webcam");
+        const canvas = document.getElementById("output_canvas");
+        const ctx = canvas.getContext("2d");
+        const drawingUtils = new DrawingUtils(ctx);
+        const distanceStatus = document.getElementById("distanceStatus");
+    
+        const loadingContainer = document.getElementById("loadingContainer");
+        const startButton = document.getElementById("startButton");
+        const recordButton = document.getElementById("recordButton");
+        const csvLoader = document.getElementById("csvLoader");
+        const recordingProgress = document.getElementById("recordingProgress");
+    
+        let poseLandmarker, handLandmarker;
+        let webcamRunning = false;
+        let recording = false;
+        let recordedFrames = [];
+        const selectedPoseIndices = [0, 1, 4, 9, 10, 11, 12, 13, 14, 15, 16];
+        const shoulderIndices = [11, 12];
+    
+        const SERVER_URL = "https://flask-tester-cx5v.onrender.com/predict"; // <-- your server endpoint
+    
+        window.addEventListener("DOMContentLoaded", async () => {
+            await initMediaPipe();
+            loadingContainer.style.display = "none";
+            startButton.style.display = "block";
+            recordButton.style.display = "block";
+            csvLoader.style.display = "block";
+        });
+    
+        startButton.addEventListener("click", async () => {
+            if (webcamRunning) return;
+            webcamRunning = true;
+            await enableWebcam();
+        });
+    
+        recordButton.addEventListener("click", async () => {
+    if (recording) return;
+    recording = true;
+    recordedFrames = [];
+
+    let framesCaptured = 0;
+    const totalFrames = 9;
+    const interval = 50;
+
+    recordingProgress.style.display = "block";
+    recordingProgress.value = 0;
+    recordingProgress.max = totalFrames;
+
+    const intervalId = setInterval(async () => {
+        const nowInMs = performance.now();
+        const poseResult = await poseLandmarker.detectForVideo(video, nowInMs);
+        const handResult = await handLandmarker.detectForVideo(video, nowInMs);
+        const row = [];
+
+        if (poseResult.landmarks && poseResult.landmarks[0]) {
+            const currentPoseLandmarks = poseResult.landmarks[0];
+            selectedPoseIndices.forEach(i => {
+                const l = currentPoseLandmarks[i];
+                if (l) {
+                    row.push(l.x, l.y);
+                } else {
+                    row.push(0, 0);
+                }
+            });
+        } else {
+            row.push(...Array(selectedPoseIndices.length * 2).fill(0));
+        }
+
+        const numHandCoordsPerHand = 21 * 2;
+        for (let h = 0; h < 2; h++) {
+            if (handResult.landmarks && handResult.landmarks[h]) {
+                const currentHandLandmarks = handResult.landmarks[h];
+                currentHandLandmarks.forEach(l => {
+                    if (l) {
+                        row.push(l.x, l.y);
+                    } else {
+                        row.push(0, 0);
+                    }
+                });
+                const pushedCoords = currentHandLandmarks.length * 2;
+                if (pushedCoords < numHandCoordsPerHand) {
+                    row.push(...Array(numHandCoordsPerHand - pushedCoords).fill(0));
+                }
+            } else {
+                row.push(...Array(numHandCoordsPerHand).fill(0));
+            }
+        }
+
+        recordedFrames.push(row);
+        framesCaptured++;
+
+        recordingProgress.value = framesCaptured;
+
+        if (framesCaptured >= totalFrames) {
+            clearInterval(intervalId);
+            recording = false;
+            recordingProgress.style.display = "none";
+            sendJSONToServer(recordedFrames); // Just send directly now
+        }
+    }, interval);
+});
+
+    
+        function downloadJSON(allFramesData) {
+            const payload = { data: allFramesData };
+            const jsonContent = JSON.stringify(payload, null, 2);
+            const blob = new Blob([jsonContent], { type: "application/json;charset=utf-8;" });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.setAttribute("href", url);
+            link.setAttribute("download", "payload.json");
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);    
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+            console.log("payload.json download initiated.");
+        }
+    
+        async function sendJSONToServer(allFramesData) {
+            const payload = { data: allFramesData };
+            try {
+                const response = await fetch(SERVER_URL, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify(payload)
+                });
+    
+                const contentType = response.headers.get("Content-Type") || "";
+                const text = await response.text();
+    
+                console.log(`✅ Status Code: ${response.status}`);
+                console.log(`✅ Raw Text:\n${text}`);
+    
+                if (contentType.includes("application/json")) {
+                    const parsed = JSON.parse(text);
+                    console.log("✅ JSON Response:", parsed);
+                    alert("Prediction: " + JSON.stringify(parsed)); // Optional
+                } else {
+                    console.warn("❌ Server did not return JSON.");
+                }
+            } catch (err) {
+                console.error("❌ Error sending to server:", err.message);
+                alert("Server error: " + err.message);
+            }
+        }
+    
+        async function initMediaPipe() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+            );
+    
+            poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+                    delegate: "CPU"
+                },
+                runningMode: "VIDEO",
+                numPoses: 1
+            });
+    
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 2
+            });
+        }
+    
+        async function enableWebcam() {
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            video.srcObject = stream;
+    
+            video.addEventListener("loadeddata", () => {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                video.width = video.videoWidth;
+                video.height = video.videoHeight;
+                const videoView = document.querySelector('.videoView');
+                videoView.style.width = video.videoWidth + 'px';
+                videoView.style.height = video.videoHeight + 'px';
+                predictWebcam();
+            });
+        }
+    
+        function detectDistance(poseLandmarks, videoWidth) {
+            if (!poseLandmarks || poseLandmarks.length === 0) {
+                return "No pose detected";
+            }
+    
+            const leftShoulderObj = poseLandmarks.find(lm => lm.index === 11);
+            const rightShoulderObj = poseLandmarks.find(lm => lm.index === 12);
+    
+            if (!leftShoulderObj || !rightShoulderObj) {
+                return "Shoulders not detected";
+            }
+    
+            const leftShoulder = leftShoulderObj;
+            const rightShoulder = rightShoulderObj;
+    
+            const shoulderWidthPixels = Math.abs(rightShoulder.x * videoWidth - leftShoulder.x * videoWidth);
+            const shoulderWidthRelative = shoulderWidthPixels / videoWidth;
+            const targetWidthRelative = 0.45;
+    
+            const tolerance = 0.05;
+    
+            if (shoulderWidthRelative > targetWidthRelative + tolerance) {
+                return "Too close";
+            } else if (shoulderWidthRelative < targetWidthRelative - tolerance) {
+                return "Too far";
+            } else {
+                return "Perfect distance";
+            }
+        }
+    
+        async function predictWebcam() {
+            const nowInMs = performance.now();
+            const poseResult = await poseLandmarker.detectForVideo(video, nowInMs);
+            const handResult = await handLandmarker.detectForVideo(video, nowInMs);
+    
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+            let poseLandmarksForDistance = [];
+            if (poseResult.landmarks && poseResult.landmarks[0]) {
+                const allPoseLandmarks = poseResult.landmarks[0].map((landmark, index) => ({ ...landmark, index }));
+                poseLandmarksForDistance = allPoseLandmarks;
+    
+                const filteredForDrawing = selectedPoseIndices
+                    .map(i => allPoseLandmarks.find(lm => lm.index === i))
+                    .filter(lm => lm);
+    
+                drawingUtils.drawLandmarks(filteredForDrawing, { color: "#00FF00", lineWidth: 2 });
+                filteredForDrawing.forEach((landmark) => {
+                    const x = landmark.x * canvas.width;
+                    const y = landmark.y * canvas.height;
+                    ctx.fillStyle = "#FFFFFF";
+                    ctx.font = "12px Arial";
+                    ctx.fillText(`P${landmark.index}`, x + 5, y - 5);
+                });
+    
+                const distanceStatusText = detectDistance(poseLandmarksForDistance, video.videoWidth);
+                distanceStatus.textContent = distanceStatusText;
+                if (distanceStatusText === "Too close") {
+                    distanceStatus.style.color = "red";
+                } else if (distanceStatusText === "Too far") {
+                    distanceStatus.style.color = "orange";
+                } else if (distanceStatusText === "Perfect distance") {
+                    distanceStatus.style.color = "green";
+                } else {
+                    distanceStatus.style.color = "#2196f3";
+                }
+            } else {
+                distanceStatus.textContent = "No pose detected";
+                distanceStatus.style.color = "#2196f3";
+            }
+    
+            if (handResult.landmarks) {
+                for (const hand of handResult.landmarks) {
+                    drawingUtils.drawLandmarks(hand, { color: "#0000FF", lineWidth: 2 });
+                    drawingUtils.drawConnectors(hand, HandLandmarker.HAND_CONNECTIONS, {
+                        color: "#00FFFF",
+                        lineWidth: 2
+                    });
+    
+                    hand.forEach((landmark, index) => {
+                        const x = landmark.x * canvas.width;
+                        const y = landmark.y * canvas.height;
+                        ctx.fillStyle = "#FFFFFF";
+                        ctx.font = "12px Arial";
+                        ctx.fillText(`H${index}`, x + 5, y - 5);
+                    });
+                }
+            }
+    
+            if (webcamRunning) {
+                window.requestAnimationFrame(predictWebcam);
+            }
+        }
+    
+        document.getElementById("csvLoader").addEventListener("change", async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+    
+            if (webcamRunning) {
+                webcamRunning = false;
+                const stream = video.srcObject;
+                if (stream) stream.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
+                startButton.disabled = false;
+                recordButton.disabled = true;
+                console.log("Webcam stopped for CSV replay.");
+            }
+    
+            const text = await file.text();
+            const lines = text.trim().split("\n").slice(1);
+            const parsedFrames = lines.map(line =>
+                line.split(",").map(val => {
+                    const num = parseFloat(val);
+                    return isNaN(num) ? 0 : num;
+                })
+            );
+    
+            let frameIndex = 0;
+            const replayFps = 7;
+            const interval = 1000 / replayFps;
+    
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+            let replayIntervalId = null;
+    
+            replayIntervalId = setInterval(() => {
+                if (frameIndex >= parsedFrames.length) {
+                    clearInterval(replayIntervalId);
+                    console.log("CSV Replay finished.");
+                    return;
+                }
+    
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                const row = parsedFrames[frameIndex];
+                if (!row) return;
+    
+                const numPoseCoords = selectedPoseIndices.length * 2;
+                for (let i = 0; i < numPoseCoords; i += 2) {
+                    const x = row[i] * canvas.width;
+                    const y = row[i + 1] * canvas.height;
+                    if (row[i] !== 0 || row[i+1] !== 0) {
+                        const originalIndex = selectedPoseIndices[i/2];
+                        ctx.beginPath();
+                        ctx.arc(x, y, 5, 0, 2 * Math.PI);
+                        ctx.fillStyle = "#00FF00";
+                        ctx.fill();
+                        ctx.fillStyle = "#FFFFFF";
+                        ctx.font = "12px Arial";
+                        ctx.fillText(`P${originalIndex}`, x + 5, y - 5);
+                    }
+                }
+    
+                let offset = numPoseCoords;
+                for (let h = 0; h < 2; h++) {
+                    for (let j = 0; j < 21; j++) {
+                        const xIndex = offset + j * 2;
+                        const yIndex = offset + j * 2 + 1;
+                        if (xIndex >= row.length || yIndex >= row.length) break;
+    
+                        const x = row[xIndex] * canvas.width;
+                        const y = row[yIndex] * canvas.height;
+    
+                        if (row[xIndex] !== 0 || row[yIndex] !== 0) {
+                            ctx.beginPath();
+                            ctx.arc(x, y, 4, 0, 2 * Math.PI);
+                            ctx.fillStyle = h === 0 ? "#0000FF" : "#FF00FF";
+                            ctx.fill();
+                        }
+                    }
+                    offset += 21 * 2;
+                }
+    
+                frameIndex++;
+            }, interval);
+        });
+    </script>
+    
+</body>
+</html>
